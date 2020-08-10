@@ -161,6 +161,7 @@ var (
 		"quote":                           quote,
 		"buildNextUpstream":               buildNextUpstream,
 		"getIngressInformation":           getIngressInformation,
+		"buildGrayIfCondition":             buildGrayIfCondition,
 		"serverConfig": func(all config.TemplateConfig, server *ingress.Server) interface{} {
 			return struct{ First, Second interface{} }{all, server}
 		},
@@ -884,6 +885,47 @@ func getIngressInformation(i, h, p interface{}) *ingressInformation {
 	}
 
 	return info
+}
+
+type grayIfCondition struct {
+	CookieCondition string
+	HeaderCondition string
+	QueryCondition  string
+}
+
+func buildGrayIfCondition(i interface{}) *grayIfCondition {
+	strategy, ok := i.(*ingress.GrayStrategy)
+	if !ok {
+		klog.Errorf("expected an '*ingress.GrayStrategy' type but %T was returned", i)
+		return &grayIfCondition{}
+	}
+
+	var cookieSlice []string
+	for k, v := range strategy.Cookie {
+		cookieSlice = append(cookieSlice, fmt.Sprintf("$http_cookie = \"%s=%s\"", k, v))
+	}
+	for k, v := range strategy.CookieRegex {
+		cookieSlice = append(cookieSlice, fmt.Sprintf("$http_cookie ~* \"%s=%s\"", k, v))
+	}
+	var headerSlice []string
+	for k, v := range strategy.Header {
+		headerSlice = append(headerSlice, fmt.Sprintf("$http_%s = \"%s\"", k, v))
+	}
+	for k, v := range strategy.HeaderRegex {
+		headerSlice = append(headerSlice, fmt.Sprintf("$http_%s ~* \"%s\"", k, v))
+	}
+	var querySlice []string
+	for k, v := range strategy.Query {
+		querySlice = append(querySlice, fmt.Sprintf("$arg_%s = \"%s\"", k, v))
+	}
+	for k, v := range strategy.QueryRegex {
+		querySlice = append(querySlice, fmt.Sprintf("$arg_%s ~* \"%s\"", k, v))
+	}
+	return &grayIfCondition{
+		CookieCondition: strings.Join(cookieSlice, " || "),
+		HeaderCondition: strings.Join(headerSlice, " || "),
+		QueryCondition: strings.Join(querySlice, " || "),
+	}
 }
 
 func buildForwardedFor(input interface{}) string {

@@ -1078,6 +1078,32 @@ stream {
             set $proxy_host          $proxy_upstream_name;
             set $pass_access_scheme  $scheme;
 
+            {{ range $k, $v := $location.GrayStrategies }}
+                {{ $condition := (buildGrayIfCondition $v) }}
+
+                {{ if (ne $condition.QueryCondition "" )}}
+                if ({{ $condition.QueryCondition }}) {
+                    set $service_name {{ $v.Service }};
+                    set $proxy_upstream_name {{ $v.Backend }};
+                }
+                {{ end }}
+
+                {{ if (ne $condition.HeaderCondition "" )}}
+                if ({{ $condition.HeaderCondition }}) {
+                    set $service_name {{ $v.Service }};
+                    set $proxy_upstream_name {{ $v.Backend }};
+                }
+                {{ end }}
+
+                {{ if (ne $condition.CookieCondition "" )}}
+                if ({{ $condition.CookieCondition }}) {
+                    set $service_name {{ $v.Service }};
+                    set $proxy_upstream_name {{ $v.Backend }};
+                }
+                {{ end }}
+
+            {{ end }}
+
             {{ if $all.Cfg.UseProxyProtocol }}
             set $pass_server_port    $proxy_protocol_server_port;
             {{ else }}

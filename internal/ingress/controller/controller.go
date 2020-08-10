@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +47,14 @@ const (
 	defUpstreamName = "upstream-default-backend"
 	defServerName   = "_"
 	rootLocation    = "/"
+)
+
+var (
+	// Regex for split nginx.ingress.kubernetes.io/service-match
+	serviceMatchRegex = regexp.MustCompile(`^(?U)([\w-]*):\s*(\w*)\("(\w*)", "(.*)"\)`)
+
+	// Regex for split nginx.ingress.kubernetes.io/service-weight
+	serviceWeightRegex = regexp.MustCompile(`^(?U)([\w-]*):\s*(\d*),\s*([\w-]*):\s*([\d*])`)
 )
 
 // Configuration contains all the settings required by an Ingress controller
@@ -461,6 +470,17 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 		ingKey := k8s.MetaNamespaceKey(ing)
 		anns := ing.ParsedAnnotations
 
+		// parse service-match
+		svcStrategy := make(map[string]*ingress.GrayStrategy)
+		if serviceMatch := ing.Annotations["nginx.ingress.kubernetes.io/service-match"]; strings.TrimSpace(serviceMatch) != "" {
+			for _, annotation := range strings.Split(serviceMatch, "\n") {
+				if strings.TrimSpace(annotation) == "" {
+					continue
+				}
+				splitServiceMatch(annotation, svcStrategy)
+			}
+		}
+
 		for _, rule := range ing.Spec.Rules {
 			host := rule.Host
 			if host == "" {
@@ -511,7 +531,18 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 				continue
 			}
 
+			// graySvcSlice describe which svc with gray stategy
+			var graySvcSlice []string
 			for _, path := range rule.HTTP.Paths {
+				if strategy := svcStrategy[path.Backend.ServiceName]; strategy != nil {
+					graySvcSlice = append(graySvcSlice, path.Backend.ServiceName)
+
+					strategy.Service = path.Backend.ServiceName
+					strategy.Backend = upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
+				}
+			}
+
+			for pathIndex, path := range rule.HTTP.Paths {
 				upsName := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
 
 				ups := upstreams[upsName]
@@ -528,6 +559,12 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 
 				addLoc := true
 				for _, loc := range server.Locations {
+					// set gray strategy with pathIndex=0
+					if pathIndex == 0 {
+						for _, svc := range graySvcSlice {
+							loc.GrayStrategies = append(loc.GrayStrategies, svcStrategy[svc])
+						}
+					}
 					if loc.Path == nginxPath {
 						// Same paths but different types are allowed
 						// (same type means overlap in the path definition)
@@ -767,12 +804,14 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 			upstreams[defBackend].Service = s
 		}
 
+		// parse service-weight annotation
+		serviceWeight := splitServiceWeight(anns)
 		for _, rule := range ing.Spec.Rules {
 			if rule.HTTP == nil {
 				continue
 			}
 
-			for _, path := range rule.HTTP.Paths {
+			for i, path := range rule.HTTP.Paths {
 				name := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
 
 				if _, ok := upstreams[name]; ok {
@@ -816,6 +855,20 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 					}
 				}
 
+				// configure weight for bluegreen
+				if i != 0 {
+					weight := serviceWeight[path.Backend.ServiceName]
+					if weight > 0 && weight < 100 {
+						upstreams[name].NoServer = true
+						upstreams[name].TrafficShapingPolicy = ingress.TrafficShapingPolicy{
+							Weight:        weight,
+							Header:        anns.Canary.Header,
+							HeaderValue:   anns.Canary.HeaderValue,
+							HeaderPattern: anns.Canary.HeaderPattern,
+							Cookie:        anns.Canary.Cookie,
+						}
+					}
+				}
 				if len(upstreams[name].Endpoints) == 0 {
 					endp, err := n.serviceEndpoints(svcKey, path.Backend.ServicePort.String())
 					if err != nil {
@@ -832,6 +885,20 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 				}
 
 				upstreams[name].Service = s
+			}
+
+			// set alternative service
+			if len(rule.HTTP.Paths) >= 2 {
+				path := rule.HTTP.Paths[0]
+				name := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
+				for i := 1; i < len(rule.HTTP.Paths); i++ {
+					if serviceWeight[path.Backend.ServiceName] != 0 {
+						upstreams[name].AlternativeBackends = append(
+							upstreams[name].AlternativeBackends,
+							upstreamName(ing.Namespace, rule.HTTP.Paths[i].Backend.ServiceName, rule.HTTP.Paths[i].Backend.ServicePort),
+						)
+					}
+				}
 			}
 		}
 	}
@@ -1496,4 +1563,101 @@ func externalNamePorts(name string, svc *apiv1.Service) *apiv1.ServicePort {
 		Port:       int32(port),
 		TargetPort: intstr.FromInt(port),
 	}
+}
+
+// split service-weight annotation
+func splitServiceWeight(anns *annotations.Ingress) map[string]int {
+	serviceWeight := make(map[string]int)
+	weightAnns := strings.Split(anns.Annotations["nginx.ingress.kubernetes.io/service-weight"], "\n")
+	if weightAnns == nil || len(weightAnns) == 0 || weightAnns[0] == "" {
+		return serviceWeight
+	}
+
+	// find submatch
+	params := serviceWeightRegex.FindStringSubmatch(weightAnns[0])
+	if params == nil || len(params) != 5 {
+		klog.Warningf("split service_weight failed, annotation: %s", anns)
+		return serviceWeight
+	}
+
+	// convert
+	pl := len(params)
+	total := 0
+	for i := 1; i < pl; i += 2 {
+		if i+1 >= pl {
+			break
+		}
+		if weight, err := strconv.Atoi(params[i+1]); err != nil {
+			klog.Warningf("split service_weight, convert string to int failed. annotation: %s", anns)
+			break
+		} else {
+			total += weight
+			serviceWeight[params[i]] = weight
+		}
+	}
+	if total == 0 {
+		klog.Warningf("split service_weight, total is 0. annotation: %s", anns)
+		return serviceWeight
+	}
+	for k, v := range serviceWeight {
+		serviceWeight[k] = (v * 100) / total
+	}
+	return serviceWeight
+}
+
+// split service-match annotation
+func splitServiceMatch(annotation string, svcStrategy map[string]*ingress.GrayStrategy) {
+	params := serviceMatchRegex.FindStringSubmatch(annotation)
+	if params == nil || len(params) != 5 {
+		klog.Warningf("split service_match failed, annotation: %s", annotation)
+		return
+	}
+
+	svc := params[1]
+	if svcStrategy[svc] == nil {
+		svcStrategy[svc] = &ingress.GrayStrategy{}
+	}
+	cod := params[2]
+	key := params[3]
+	val := params[4]
+	if cod == "cookie" {
+		if svcStrategy[svc].Cookie == nil {
+			svcStrategy[svc].Cookie = make(map[string]string)
+		}
+		if svcStrategy[svc].CookieRegex == nil {
+			svcStrategy[svc].CookieRegex = make(map[string]string)
+		}
+		if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+			svcStrategy[svc].CookieRegex[key] = val[1 : len(val)-1]
+		} else {
+			svcStrategy[svc].Cookie[key] = val
+		}
+	}
+	if cod == "header" {
+		if svcStrategy[svc].Header == nil {
+			svcStrategy[svc].Header = make(map[string]string)
+		}
+		if svcStrategy[svc].HeaderRegex == nil {
+			svcStrategy[svc].HeaderRegex = make(map[string]string)
+		}
+		if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+			svcStrategy[svc].HeaderRegex[key] = val[1 : len(val)-1]
+		} else {
+			svcStrategy[svc].Header[key] = val
+		}
+	}
+	if cod == "query" {
+		if svcStrategy[svc].Query == nil {
+			svcStrategy[svc].Query = make(map[string]string)
+		}
+		if svcStrategy[svc].QueryRegex == nil {
+			svcStrategy[svc].QueryRegex = make(map[string]string)
+		}
+		if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+			svcStrategy[svc].QueryRegex[key] = val[1 : len(val)-1]
+		} else {
+			svcStrategy[svc].Query[key] = val
+		}
+	}
+	svcStrategy[svc].Service = svc
 }
