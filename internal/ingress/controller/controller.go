@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog"
+
 	"k8s.io/ingress-nginx/internal/ingress"
 	"k8s.io/ingress-nginx/internal/ingress/annotations"
 	"k8s.io/ingress-nginx/internal/ingress/annotations/class"
@@ -39,13 +42,23 @@ import (
 	ngx_config "k8s.io/ingress-nginx/internal/ingress/controller/config"
 	"k8s.io/ingress-nginx/internal/k8s"
 	"k8s.io/ingress-nginx/internal/nginx"
-	"k8s.io/klog"
 )
 
 const (
 	defUpstreamName = "upstream-default-backend"
 	defServerName   = "_"
 	rootLocation    = "/"
+)
+
+var (
+	// Regex for split nginx.ingress.kubernetes.io/service-match
+	serviceMatchRegex = regexp.MustCompile(`^(?U)([\w-]*):\s*(\w*)\("(\w*)", "(.*)"\)$`)
+
+	// Regex for split nginx.ingress.kubernetes.io/service-weight
+	serviceWeightRegex = regexp.MustCompile(`^(?U)([\w-]*):\s*(\d*),\s*([\w-]*):\s*(\d+)$`)
+
+	AnnotationServiceMatch  = "nginx.ingress.kubernetes.io/service-match"
+	AnnotationServiceWeight = "nginx.ingress.kubernetes.io/service-weight"
 )
 
 // Configuration contains all the settings required by an Ingress controller
@@ -402,6 +415,7 @@ func (n *NGINXController) getDefaultUpstream() *ingress.Backend {
 // getConfiguration returns the configuration matching the standard kubernetes ingress
 func (n *NGINXController) getConfiguration(ingresses []*ingress.Ingress) (sets.String, []*ingress.Server, *ingress.Configuration) {
 	upstreams, servers := n.getBackendServers(ingresses)
+
 	var passUpstreams []*ingress.SSLPassthroughBackend
 
 	hosts := sets.NewString()
@@ -461,6 +475,8 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 		ingKey := k8s.MetaNamespaceKey(ing)
 		anns := ing.ParsedAnnotations
 
+		// parse service-match
+		svcStrategy := splitServiceMatch(ing)
 		for _, rule := range ing.Spec.Rules {
 			host := rule.Host
 			if host == "" {
@@ -511,8 +527,19 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 				continue
 			}
 
+			// graySvcSlice describe which svc with gray stategy
+			var graySvcSlice []string
 			for _, path := range rule.HTTP.Paths {
-				upsName := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
+				if strategy := svcStrategy[path.Backend.ServiceName]; strategy != nil {
+					graySvcSlice = append(graySvcSlice, path.Backend.ServiceName)
+
+					strategy.Service = path.Backend.ServiceName
+					strategy.Backend = upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
+				}
+			}
+
+			for pathIndex, path := range rule.HTTP.Paths {
+				upsName := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
 
 				ups := upstreams[upsName]
 
@@ -528,6 +555,12 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 
 				addLoc := true
 				for _, loc := range server.Locations {
+					// set gray strategy with pathIndex=0
+					if pathIndex == 0 {
+						for _, svc := range graySvcSlice {
+							loc.GrayStrategies = append(loc.GrayStrategies, svcStrategy[svc])
+						}
+					}
 					if loc.Path == nginxPath {
 						// Same paths but different types are allowed
 						// (same type means overlap in the path definition)
@@ -714,7 +747,7 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 
 		var defBackend string
 		if ing.Spec.Backend != nil {
-			defBackend = upstreamName(ing.Namespace, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
+			defBackend = upstreamName(ing, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
 
 			klog.V(3).Infof("Creating upstream %q", defBackend)
 			upstreams[defBackend] = newUpstream(defBackend)
@@ -729,6 +762,10 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 			}
 
 			svcKey := fmt.Sprintf("%v/%v", ing.Namespace, ing.Spec.Backend.ServiceName)
+			// support across namespace
+			if s := strings.Split(ing.Spec.Backend.ServiceName, "-ns-"); len(s) == 2 {
+				svcKey = fmt.Sprintf("%v/%v", s[0], s[1])
+			}
 
 			// add the service ClusterIP as a single Endpoint instead of individual Endpoints
 			if anns.ServiceUpstream {
@@ -767,14 +804,15 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 			upstreams[defBackend].Service = s
 		}
 
+		// parse service-weight annotation
+		serviceWeight := splitServiceWeight(ing)
 		for _, rule := range ing.Spec.Rules {
 			if rule.HTTP == nil {
 				continue
 			}
 
-			for _, path := range rule.HTTP.Paths {
-				name := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
-
+			for i, path := range rule.HTTP.Paths {
+				name := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
 				if _, ok := upstreams[name]; ok {
 					continue
 				}
@@ -793,6 +831,9 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 				}
 
 				svcKey := fmt.Sprintf("%v/%v", ing.Namespace, path.Backend.ServiceName)
+				if s := strings.Split(path.Backend.ServiceName, "-ns-"); len(s) == 2 {
+					svcKey = fmt.Sprintf("%v/%v", s[0], s[1])
+				}
 
 				// add the service ClusterIP as a single Endpoint instead of individual Endpoints
 				if anns.ServiceUpstream {
@@ -816,6 +857,20 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 					}
 				}
 
+				// configure weight for bluegreen
+				if i != 0 {
+					weight := serviceWeight[path.Backend.ServiceName]
+					if weight > 0 && weight < 100 {
+						upstreams[name].NoServer = true
+						upstreams[name].TrafficShapingPolicy = ingress.TrafficShapingPolicy{
+							Weight:        weight,
+							Header:        anns.Canary.Header,
+							HeaderValue:   anns.Canary.HeaderValue,
+							HeaderPattern: anns.Canary.HeaderPattern,
+							Cookie:        anns.Canary.Cookie,
+						}
+					}
+				}
 				if len(upstreams[name].Endpoints) == 0 {
 					endp, err := n.serviceEndpoints(svcKey, path.Backend.ServicePort.String())
 					if err != nil {
@@ -832,6 +887,20 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 				}
 
 				upstreams[name].Service = s
+			}
+
+			// set alternative service
+			if len(rule.HTTP.Paths) >= 2 && len(serviceWeight) == 2 {
+				path := rule.HTTP.Paths[0]
+				name := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
+				for i := 1; i < len(rule.HTTP.Paths); i++ {
+					if serviceWeight[path.Backend.ServiceName] != 0 {
+						upstreams[name].AlternativeBackends = append(
+							upstreams[name].AlternativeBackends,
+							upstreamName(ing, rule.HTTP.Paths[i].Backend.ServiceName, rule.HTTP.Paths[i].Backend.ServicePort),
+						)
+					}
+				}
 			}
 		}
 	}
@@ -995,7 +1064,7 @@ func (n *NGINXController) createServers(data []*ingress.Ingress,
 		}
 
 		if ing.Spec.Backend != nil {
-			defUpstream := upstreamName(ing.Namespace, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
+			defUpstream := upstreamName(ing, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
 
 			if backendUpstream, ok := upstreams[defUpstream]; ok {
 				// use backend specified in Ingress as the default backend for all its rules
@@ -1256,7 +1325,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 
 	// merge catch-all alternative backends
 	if ing.Spec.Backend != nil {
-		upsName := upstreamName(ing.Namespace, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
+		upsName := upstreamName(ing, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
 
 		altUps := upstreams[upsName]
 
@@ -1293,7 +1362,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 
 	for _, rule := range ing.Spec.Rules {
 		for _, path := range rule.HTTP.Paths {
-			upsName := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
+			upsName := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
 
 			altUps := upstreams[upsName]
 
@@ -1496,4 +1565,154 @@ func externalNamePorts(name string, svc *apiv1.Service) *apiv1.ServicePort {
 		Port:       int32(port),
 		TargetPort: intstr.FromInt(port),
 	}
+}
+
+// split service-weight annotation
+func splitServiceWeight(ing *ingress.Ingress) (serviceWeight map[string]int) {
+	serviceWeight = make(map[string]int)
+
+	weightAnns := strings.Split(ing.Annotations[AnnotationServiceWeight], "\n")
+	if weightAnns == nil || len(weightAnns) == 0 || weightAnns[0] == "" {
+		return serviceWeight
+	}
+
+	klog.Infof("[service-weight] received annotation, namespace: %s, ingress: %s, value: %s",
+		ing.Namespace, ing.Name, weightAnns)
+
+	// find submatch
+	params := serviceWeightRegex.FindStringSubmatch(weightAnns[0])
+	if params == nil || len(params) != 5 {
+		klog.Warningf("[service-weight] split failed because not excepted, namespace: %s, ingress: %s, value: %s",
+			ing.Namespace, ing.Name, weightAnns)
+		return serviceWeight
+	}
+
+	// trim
+	for k, v := range params {
+		params[k] = strings.TrimSpace(v)
+	}
+
+	// convert
+	pl := len(params)
+	total := 0
+	for i := 1; i < pl; i += 2 {
+		if i+1 >= pl {
+			break
+		}
+		if weight, err := strconv.Atoi(params[i+1]); err != nil {
+			klog.Warningf("[service-weight] convert string to int failed, namespace: %s, ingress: %s, value: %s=%s",
+				ing.Namespace, ing.Name, params[i], params[i+1])
+			break
+		} else {
+			total += weight
+			serviceWeight[params[i]] = weight
+		}
+	}
+	if total == 0 {
+		klog.Warningf("[service-weight] counter weight total equal 0, namespace: %s, ingress: %s",
+			ing.Namespace, ing.Name)
+		return serviceWeight
+	}
+
+	for k, v := range serviceWeight {
+		serviceWeight[k] = (v * 100) / total
+		klog.Infof("[service-weight] detail rule-value: %s=%d, namespace: %s, name: %s", k, v, ing.Namespace, ing.Name)
+	}
+	klog.Infof("[service-weight] split bluegreen strategy rules successfully, namespace: %s, name: %s",
+		ing.Namespace, ing.Name)
+	return serviceWeight
+}
+
+// split service-match annotation
+func splitServiceMatch(ing *ingress.Ingress) (svcStrategy map[string]*ingress.GrayStrategy) {
+	svcStrategy = make(map[string]*ingress.GrayStrategy)
+
+	if serviceMatch := ing.Annotations[AnnotationServiceMatch]; strings.TrimSpace(serviceMatch) != "" {
+		for _, annotation := range strings.Split(serviceMatch, "\n") {
+			if annotation = strings.TrimSpace(annotation); annotation == "" {
+				continue
+			}
+
+			klog.Infof("[service-match] received annotation, namespace: %s, ingress: %s, value: %s",
+				ing.Namespace, ing.Name, annotation)
+
+			// split service-match annotation
+			params := serviceMatchRegex.FindStringSubmatch(annotation)
+			if params == nil || len(params) != 5 {
+				klog.Warningf("[service-match] split failed because not excepted, namespace: %s, ingress: %s, "+
+					"value: %s", ing.Namespace, ing.Name, annotation)
+				return
+			}
+
+			// trim
+			for k, v := range params {
+				params[k] = strings.TrimSpace(v)
+			}
+
+			svc := params[1]
+			if svcStrategy[svc] == nil {
+				svcStrategy[svc] = &ingress.GrayStrategy{}
+			}
+			cod := params[2]
+			key := params[3]
+			val := params[4]
+			switch cod {
+			case "cookie":
+				{
+					if svcStrategy[svc].Cookie == nil {
+						svcStrategy[svc].Cookie = make(map[string]string)
+					}
+					if svcStrategy[svc].CookieRegex == nil {
+						svcStrategy[svc].CookieRegex = make(map[string]string)
+					}
+					if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+						svcStrategy[svc].CookieRegex[key] = val[1 : len(val)-1]
+						klog.Infof("[service-match] cookie regex rule, service: %s, rule: %s=%s", svc, key, val)
+					} else {
+						svcStrategy[svc].Cookie[key] = val
+						klog.Infof("[service-match] cookie normal rule, service: %s, rule: %s=%s", svc, key, val)
+					}
+					break
+				}
+			case "header":
+				{
+					if svcStrategy[svc].Header == nil {
+						svcStrategy[svc].Header = make(map[string]string)
+					}
+					if svcStrategy[svc].HeaderRegex == nil {
+						svcStrategy[svc].HeaderRegex = make(map[string]string)
+					}
+					if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+						svcStrategy[svc].HeaderRegex[key] = val[1 : len(val)-1]
+						klog.Infof("[service-match] header regex rule, service: %s, rule: %s=%s", svc, key, val)
+					} else {
+						svcStrategy[svc].Header[key] = val
+						klog.Infof("[service-match] header normal rule, service: %s, rule: %s=%s", svc, key, val)
+					}
+					break
+				}
+			case "query":
+				{
+					if svcStrategy[svc].Query == nil {
+						svcStrategy[svc].Query = make(map[string]string)
+					}
+					if svcStrategy[svc].QueryRegex == nil {
+						svcStrategy[svc].QueryRegex = make(map[string]string)
+					}
+					if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+						svcStrategy[svc].QueryRegex[key] = val[1 : len(val)-1]
+						klog.Infof("[service-match] query regex rule, service: %s, rule: %s=%s", svc, key, val)
+					} else {
+						svcStrategy[svc].Query[key] = val
+						klog.Infof("[service-match] query normal rule, service: %s, rule: %s=%s", svc, key, val)
+					}
+				}
+			default:
+			}
+			svcStrategy[svc].Service = svc
+		}
+		klog.Infof("[service-match] split gray strategy rules successfully, namespace: %s, name: %s",
+			ing.Namespace, ing.Name)
+	}
+	return svcStrategy
 }
