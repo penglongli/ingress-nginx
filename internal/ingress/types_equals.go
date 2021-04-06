@@ -315,6 +315,65 @@ func (s1 *Server) Equal(s2 *Server) bool {
 	if len(s1.Locations) != len(s2.Locations) {
 		return false
 	}
+	// compare annotation strategy and out-of-cluster domain
+	for i, l1 := range s1.Locations {
+		l2 := s2.Locations[i]
+		if l1 == nil || l2 == nil {
+			return false
+		}
+
+		if len(l1.GrayStrategies) != len(l2.GrayStrategies) {
+			return false
+		}
+		// gray strategy compare
+		for j, sy1 := range l1.GrayStrategies {
+			sy2 := l2.GrayStrategies[j]
+			if sy1 == nil || sy2 == nil {
+				return false
+			}
+			if (sy1.Cookie == nil && sy2.Cookie != nil) ||
+				(sy1.Cookie != nil && sy2.Cookie == nil) ||
+				(sy1.CookieRegex != nil && sy2.CookieRegex == nil) ||
+				(sy1.CookieRegex == nil && sy2.CookieRegex != nil) {
+				return false
+			}
+			for k, v := range sy1.Cookie {
+				if v != sy2.Cookie[k] {
+					return false
+				}
+			}
+			for k, v := range sy1.CookieRegex {
+				if v != sy2.CookieRegex[k] {
+					return false
+				}
+			}
+
+			if (sy1.Header == nil && sy2.Header != nil) ||
+				(sy1.Header != nil && sy2.Header == nil) ||
+				(sy1.HeaderRegex == nil && sy2.HeaderRegex != nil) ||
+				(sy1.HeaderRegex != nil && sy2.HeaderRegex == nil) {
+				return false
+			}
+			for k, v := range sy1.Header {
+				if v != sy2.Header[k] {
+					return false
+				}
+			}
+
+			if (sy1.Query == nil && sy2.Query != nil) ||
+				(sy1.Query != nil && sy2.Query == nil) ||
+				(sy1.QueryRegex == nil && sy2.QueryRegex != nil) ||
+				(sy1.QueryRegex != nil && sy2.QueryRegex == nil) {
+				return false
+			}
+			for k, v := range sy1.Query {
+				if v != sy2.Query[k] {
+					return false
+				}
+			}
+		}
+
+	}
 
 	// Location are sorted
 	for idx, s1l := range s1.Locations {

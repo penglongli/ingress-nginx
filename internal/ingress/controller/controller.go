@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog"
+
 	"k8s.io/ingress-nginx/internal/ingress"
 	"k8s.io/ingress-nginx/internal/ingress/annotations"
 	"k8s.io/ingress-nginx/internal/ingress/annotations/class"
@@ -39,13 +42,46 @@ import (
 	ngx_config "k8s.io/ingress-nginx/internal/ingress/controller/config"
 	"k8s.io/ingress-nginx/internal/k8s"
 	"k8s.io/ingress-nginx/internal/nginx"
-	"k8s.io/klog"
 )
 
 const (
 	defUpstreamName = "upstream-default-backend"
 	defServerName   = "_"
 	rootLocation    = "/"
+	outOfCluster    = "out-of-cluster"
+)
+
+var (
+	// Regex for split nginx.ingress.kubernetes.io/service-match
+	serviceMatchRegex = regexp.MustCompile(`^(?U)([\w-]*):\s*(\w*)\("(\w*)", "(.*)"\)$`)
+
+	// Regex for split nginx.ingress.kubernetes.io/service-weight
+	serviceWeightRegex = regexp.MustCompile(`^(?U)([\w-]*):\s*(\d*),\s*([\w-]*):\s*(\d+)$`)
+
+	// Regex for split nginx.ingress.kubernetes.io/service-alias
+	serviceAliasRegex = regexp.MustCompile(`^(?U)([\w-]*):\s*(.*)$`)
+
+	// Service match for traffic forwarding
+	// E.g: (if http_request's cookie c=test, and will forward to centos2)
+	// nginx.ingress.kubernetes.io/service-match: |
+	//   centos2: cookie("c", "test")
+	AnnotationServiceMatch  = "nginx.ingress.kubernetes.io/service-match"
+	// Service weight for traffic forwarding
+	// E.g: (30% http_request will forward to centos1)
+	// nginx.ingress.kubernetes.io/service-weight: |
+	//   centos1: 30, centos2: 70
+	AnnotationServiceWeight = "nginx.ingress.kubernetes.io/service-weight"
+
+	// service-domain and service-alias are often used together
+	// service-domain declares the service whether out-of-cluster
+	// service-alias declares the service's alias name
+	// E.g:
+	// nginx.ingress.kubernetes.io/service-alias: |
+	//   test: 1.1.1.1||2.2.2.2||3.3.3.3
+	// nginx.ingress.kubernetes.io/service-domain: |
+	//   test: out-of-cluster
+	AnnotationServiceDomain = "nginx.ingress.kubernetes.io/service-domain"
+	AnnotationServiceAlias = "nginx.ingress.kubernetes.io/service-alias"
 )
 
 // Configuration contains all the settings required by an Ingress controller
@@ -452,6 +488,23 @@ func (n *NGINXController) getConfiguration(ingresses []*ingress.Ingress) (sets.S
 // service name and port are the same.
 func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*ingress.Backend, []*ingress.Server) {
 	du := n.getDefaultUpstream()
+
+	// parse annotations
+	for _, ing := range ingresses {
+		// split service weight
+		ing.BlueGreenStrategy = splitServiceWeight(ing)
+		// split service match
+		ing.GrayStrategy = splitServiceMatch(ing)
+		// split service domain
+		ing.ServiceDomain = splitServiceDomain(ing)
+		// split service alias
+		ing.ServiceAlias  = splitServiceAlias(ing)
+		// init
+		ing.ServiceOutClusterEndpoint = make(map[string][]string)
+		// init
+		ing.ServiceOutClusterDomain = make(map[string]string)
+	}
+
 	upstreams := n.createUpstreams(ingresses, du)
 	servers := n.createServers(ingresses, upstreams, du)
 
@@ -511,8 +564,19 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 				continue
 			}
 
+			// graySvcSlice describe which svc with gray stategy
+			var graySvcSlice []string
 			for _, path := range rule.HTTP.Paths {
-				upsName := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
+				if strategy := ing.GrayStrategy[path.Backend.ServiceName]; strategy != nil {
+					graySvcSlice = append(graySvcSlice, path.Backend.ServiceName)
+
+					strategy.Service = path.Backend.ServiceName
+					strategy.Backend = upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
+				}
+			}
+
+			for pathIndex, path := range rule.HTTP.Paths {
+				upsName := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
 
 				ups := upstreams[upsName]
 
@@ -528,6 +592,12 @@ func (n *NGINXController) getBackendServers(ingresses []*ingress.Ingress) ([]*in
 
 				addLoc := true
 				for _, loc := range server.Locations {
+					// set gray strategy with pathIndex=0
+					if pathIndex == 0 {
+						for _, svc := range graySvcSlice {
+							loc.GrayStrategies = append(loc.GrayStrategies, ing.GrayStrategy[svc])
+						}
+					}
 					if loc.Path == nginxPath {
 						// Same paths but different types are allowed
 						// (same type means overlap in the path definition)
@@ -714,7 +784,7 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 
 		var defBackend string
 		if ing.Spec.Backend != nil {
-			defBackend = upstreamName(ing.Namespace, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
+			defBackend = upstreamName(ing, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
 
 			klog.V(3).Infof("Creating upstream %q", defBackend)
 			upstreams[defBackend] = newUpstream(defBackend)
@@ -772,9 +842,8 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 				continue
 			}
 
-			for _, path := range rule.HTTP.Paths {
-				name := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
-
+			for i, path := range rule.HTTP.Paths {
+				name := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
 				if _, ok := upstreams[name]; ok {
 					continue
 				}
@@ -792,13 +861,14 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 					upstreams[name].LoadBalancing = n.store.GetBackendConfiguration().LoadBalancing
 				}
 
-				svcKey := fmt.Sprintf("%v/%v", ing.Namespace, path.Backend.ServiceName)
+				serviceName := path.Backend.ServiceName
 
 				// add the service ClusterIP as a single Endpoint instead of individual Endpoints
 				if anns.ServiceUpstream {
-					endpoint, err := n.getServiceClusterEndpoint(svcKey, &path.Backend)
+					endpoint, err := n.getServiceEndpointOrOutOfCluster(ing, serviceName, &path.Backend)
 					if err != nil {
-						klog.Errorf("Failed to determine a suitable ClusterIP Endpoint for Service %q: %v", svcKey, err)
+						klog.Errorf("Failed to determine a suitable ClusterIP Endpoint for Service %q: %v",
+							serviceName, err)
 					} else {
 						upstreams[name].Endpoints = []ingress.Endpoint{endpoint}
 					}
@@ -816,27 +886,124 @@ func (n *NGINXController) createUpstreams(data []*ingress.Ingress, du *ingress.B
 					}
 				}
 
+				// configure weight for bluegreen
+				if i != 0 {
+					weight := ing.BlueGreenStrategy[path.Backend.ServiceName]
+					if weight >= 0 && weight <= 100 {
+						upstreams[name].NoServer = true
+						upstreams[name].TrafficShapingPolicy = ingress.TrafficShapingPolicy{
+							Weight:        weight,
+							Header:        anns.Canary.Header,
+							HeaderValue:   anns.Canary.HeaderValue,
+							HeaderPattern: anns.Canary.HeaderPattern,
+							Cookie:        anns.Canary.Cookie,
+						}
+					}
+				}
+
 				if len(upstreams[name].Endpoints) == 0 {
-					endp, err := n.serviceEndpoints(svcKey, path.Backend.ServicePort.String())
+					endp, err := n.serviceEndpointsOrOutOfCluster(ing, serviceName, path.Backend.ServicePort)
 					if err != nil {
-						klog.Warningf("Error obtaining Endpoints for Service %q: %v", svcKey, err)
+						klog.Warningf("Error obtaining Endpoints for Service %q: %v", serviceName, err)
 						continue
 					}
 					upstreams[name].Endpoints = endp
 				}
 
-				s, err := n.store.GetService(svcKey)
-				if err != nil {
-					klog.Warningf("Error obtaining Service %q: %v", svcKey, err)
-					continue
+				svcKey := ""
+				if domain, ok := ing.ServiceDomain[serviceName]; ok {
+					if domain != outOfCluster {
+						svcKey = fmt.Sprintf("%v/%v", domain, serviceName)
+					}
+				} else {
+					svcKey = fmt.Sprintf("%v/%v", ing.Namespace, serviceName)
 				}
+				if svcKey != "" {
+					s, err := n.store.GetService(svcKey)
+					if err != nil {
+						klog.Warningf("Error obtaining Service %q: %v", svcKey, err)
+						continue
+					}
 
-				upstreams[name].Service = s
+					upstreams[name].Service = s
+				}
+			}
+
+			// set alternative service
+			if len(rule.HTTP.Paths) >= 2 && len(ing.BlueGreenStrategy) == 2 {
+				path := rule.HTTP.Paths[0]
+				name := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
+				for i := 1; i < len(rule.HTTP.Paths); i++ {
+					// if ing.BlueGreenStrategy[path.Backend.ServiceName] != 0 {}
+					upstreams[name].AlternativeBackends = append(
+						upstreams[name].AlternativeBackends,
+						upstreamName(ing, rule.HTTP.Paths[i].Backend.ServiceName, rule.HTTP.Paths[i].Backend.ServicePort),
+					)
+				}
 			}
 		}
 	}
 
 	return upstreams
+}
+
+/// getServiceEndpointOrOutOfCluster returns an Endpoint corresponding to the ClusterIP
+// field of a Service.
+func (n *NGINXController) getServiceEndpointOrOutOfCluster(ing *ingress.Ingress, serviceName string, backend *networking.IngressBackend) (endpoint ingress.Endpoint, err error) {
+	ns := ing.Namespace
+	if v, ok := ing.ServiceDomain[serviceName]; ok {
+		ns = v
+	}
+
+	klog.Infof("[service-endpoint] received get service-endpoint request, ns: %s, svc: %s", ns, serviceName)
+	
+	if ns == outOfCluster {
+		if v, ok := ing.ServiceAlias[serviceName]; ok {
+			endpoint.Address = v
+		} else {
+			klog.Errorf("[service-endpoint] out-of-cluster not have an alia, svc: %s", serviceName)
+			return endpoint, fmt.Errorf("out-of-cluster service not have an alia")
+		}
+
+		if backend.ServicePort.Type == intstr.String {
+			endpoint.Port = fmt.Sprintf("%d", backend.ServicePort.IntVal)
+		} else {
+			endpoint.Port = backend.ServicePort.String()
+		}
+		return endpoint, nil
+	}
+
+	svcKey := fmt.Sprintf("%v/%v", ns, serviceName)
+	svc, err := n.store.GetService(svcKey)
+	if err != nil {
+		return endpoint, fmt.Errorf("service %q does not exist", svcKey)
+	}
+
+	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
+		return endpoint, fmt.Errorf("no ClusterIP found for Service %q", svcKey)
+	}
+
+	endpoint.Address = svc.Spec.ClusterIP
+
+	// if the Service port is referenced by name in the Ingress, lookup the
+	// actual port in the service spec
+	if backend.ServicePort.Type == intstr.String {
+		var port int32 = -1
+		for _, svcPort := range svc.Spec.Ports {
+			if svcPort.Name == backend.ServicePort.String() {
+				port = svcPort.Port
+				break
+			}
+		}
+		if port == -1 {
+			return endpoint, fmt.Errorf("service %q does not have a port named %q", svc.Name, backend.ServicePort)
+		}
+		endpoint.Port = fmt.Sprintf("%d", port)
+	} else {
+		endpoint.Port = backend.ServicePort.String()
+	}
+
+	return endpoint, err
 }
 
 // getServiceClusterEndpoint returns an Endpoint corresponding to the ClusterIP
@@ -872,6 +1039,77 @@ func (n *NGINXController) getServiceClusterEndpoint(svcKey string, backend *netw
 	}
 
 	return endpoint, err
+}
+
+func (n *NGINXController) serviceEndpointsOrOutOfCluster(ing *ingress.Ingress, serviceName string,
+	backendPort intstr.IntOrString) ([]ingress.Endpoint, error) {
+	ns := ing.Namespace
+	if v, ok := ing.ServiceDomain[serviceName]; ok {
+		ns = v
+	}
+
+	klog.Infof("[service-endpoint] received service-endpoints request, ns: %s, svc: %s", ns, serviceName)
+
+	var upstreams []ingress.Endpoint
+	if ns == outOfCluster {
+		if v, ok := ing.ServiceAlias[serviceName]; ok {
+			name := upstreamName(ing, serviceName, backendPort)
+			ing.ParseOutOfClusterHost(name, v)
+
+			// set endpoint address
+			edps := ing.ServiceOutClusterEndpoint[name]
+			for _, item := range edps {
+				upstreams = append(upstreams, ingress.Endpoint{
+					Address: item,
+					Port: backendPort.String(),
+				})
+			}
+		} else {
+			klog.Errorf("[service-endpoint] out-of-cluster not have an alia, ignore this annotation. Service: %s",
+				serviceName)
+			return upstreams, fmt.Errorf("out-of-cluster service not have an alia")
+		}
+		return upstreams, nil
+	}
+
+	svcKey := fmt.Sprintf("%v/%v", ns, serviceName)
+	svc, err := n.store.GetService(svcKey)
+	if err != nil {
+		return upstreams, err
+	}
+
+	klog.V(3).Infof("Obtaining ports information for Service %q", svcKey)
+
+	// Ingress with an ExternalName Service and no port defined for that Service
+	if svc.Spec.Type == apiv1.ServiceTypeExternalName {
+		servicePort := externalNamePorts(backendPort.String(), svc)
+		endps := getEndpoints(svc, servicePort, apiv1.ProtocolTCP, n.store.GetServiceEndpoints)
+		if len(endps) == 0 {
+			klog.Warningf("Service %q does not have any active Endpoint.", svcKey)
+			return upstreams, nil
+		}
+
+		upstreams = append(upstreams, endps...)
+		return upstreams, nil
+	}
+
+	for _, servicePort := range svc.Spec.Ports {
+		// targetPort could be a string, use either the port name or number (int)
+		if strconv.Itoa(int(servicePort.Port)) == backendPort.String() ||
+			servicePort.TargetPort.String() == backendPort.String() ||
+			servicePort.Name == backendPort.String() {
+
+			endps := getEndpoints(svc, &servicePort, apiv1.ProtocolTCP, n.store.GetServiceEndpoints)
+			if len(endps) == 0 {
+				klog.Warningf("Service %q does not have any active Endpoint.", svcKey)
+			}
+
+			upstreams = append(upstreams, endps...)
+			break
+		}
+	}
+
+	return upstreams, nil
 }
 
 // serviceEndpoints returns the upstream servers (Endpoints) associated with a Service.
@@ -995,7 +1233,7 @@ func (n *NGINXController) createServers(data []*ingress.Ingress,
 		}
 
 		if ing.Spec.Backend != nil {
-			defUpstream := upstreamName(ing.Namespace, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
+			defUpstream := upstreamName(ing, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
 
 			if backendUpstream, ok := upstreams[defUpstream]; ok {
 				// use backend specified in Ingress as the default backend for all its rules
@@ -1256,7 +1494,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 
 	// merge catch-all alternative backends
 	if ing.Spec.Backend != nil {
-		upsName := upstreamName(ing.Namespace, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
+		upsName := upstreamName(ing, ing.Spec.Backend.ServiceName, ing.Spec.Backend.ServicePort)
 
 		altUps := upstreams[upsName]
 
@@ -1293,7 +1531,7 @@ func mergeAlternativeBackends(ing *ingress.Ingress, upstreams map[string]*ingres
 
 	for _, rule := range ing.Spec.Rules {
 		for _, path := range rule.HTTP.Paths {
-			upsName := upstreamName(ing.Namespace, path.Backend.ServiceName, path.Backend.ServicePort)
+			upsName := upstreamName(ing, path.Backend.ServiceName, path.Backend.ServicePort)
 
 			altUps := upstreams[upsName]
 
@@ -1496,4 +1734,206 @@ func externalNamePorts(name string, svc *apiv1.Service) *apiv1.ServicePort {
 		Port:       int32(port),
 		TargetPort: intstr.FromInt(port),
 	}
+}
+
+// split service-alias annotation
+func splitServiceAlias(ing *ingress.Ingress) (serviceAlias map[string]string) {
+	serviceAlias = make(map[string]string)
+
+	aliaAnns := strings.Split(ing.Annotations[AnnotationServiceAlias], "\n")
+	if len(aliaAnns) == 0 || aliaAnns[0] == "" {
+		return serviceAlias
+	}
+
+	klog.Infof("[service-alias] received annotation, namespace: %s, ingress: %s, value: %s",
+		ing.Namespace, ing.Name, aliaAnns)
+
+	aliaSlice := strings.Split(strings.TrimSpace(aliaAnns[0]), ",")
+	for _, ann := range aliaSlice {
+		tmp := strings.Split(ann, ":")
+		if len(tmp) != 2 {
+			klog.Errorf("[service-alias] namespace: %s, ingress: %s, value: %s not right",
+				ing.Namespace, ing.Name, tmp)
+			continue
+		}
+
+		serviceAlias[strings.TrimSpace(tmp[0])] = strings.TrimSpace(tmp[1])
+	}
+	return serviceAlias
+}
+
+// split service-domain annotation
+func splitServiceDomain(ing *ingress.Ingress) (serviceDomain map[string]string) {
+	serviceDomain = make(map[string]string)
+
+	domainAnns := strings.Split(ing.Annotations[AnnotationServiceDomain], "\n")
+	if len(domainAnns) == 0 || domainAnns[0] == "" {
+		return serviceDomain
+	}
+
+	klog.Infof("[service-domain] received annotation, namespace: %s, ingress: %s, value: %s",
+		ing.Namespace, ing.Name, domainAnns)
+
+	svcSlice := strings.Split(strings.TrimSpace(domainAnns[0]), ",")
+	for _, ann := range svcSlice {
+		tmp := strings.Split(ann, ":")
+		if len(tmp) != 2 {
+			klog.Errorf("[service-domain] namespace: %s, ingress: %s, value: %s not right",
+				ing.Namespace, ing.Name, tmp)
+			continue
+		}
+
+		serviceDomain[strings.TrimSpace(tmp[0])] = strings.TrimSpace(tmp[1])
+	}
+	return serviceDomain
+}
+
+// split service-weight annotation
+func splitServiceWeight(ing *ingress.Ingress) (serviceWeight map[string]int) {
+	serviceWeight = make(map[string]int)
+
+	weightAnns := strings.Split(ing.Annotations[AnnotationServiceWeight], "\n")
+	if len(weightAnns) == 0 || weightAnns[0] == "" {
+		return serviceWeight
+	}
+
+	klog.Infof("[service-weight] received annotation, namespace: %s, ingress: %s, value: %s",
+		ing.Namespace, ing.Name, weightAnns)
+
+	// find submatch
+	params := serviceWeightRegex.FindStringSubmatch(strings.TrimSpace(weightAnns[0]))
+	if params == nil || len(params) != 5 {
+		klog.Errorf("[service-weight] split failed because not excepted, namespace: %s, ingress: %s, value: %s",
+			ing.Namespace, ing.Name, weightAnns)
+		return serviceWeight
+	}
+
+	// trim
+	for k, v := range params {
+		params[k] = strings.TrimSpace(v)
+	}
+
+	// convert
+	pl := len(params)
+	total := 0
+	for i := 1; i < pl; i += 2 {
+		if i+1 >= pl {
+			break
+		}
+		if weight, err := strconv.Atoi(params[i+1]); err != nil {
+			klog.Errorf("[service-weight] convert string to int failed, namespace: %s, ingress: %s, value: %s=%s",
+				ing.Namespace, ing.Name, params[i], params[i+1])
+			break
+		} else {
+			total += weight
+			serviceWeight[params[i]] = weight
+		}
+	}
+	if total == 0 {
+		klog.Errorf("[service-weight] counter weight total equal 0, namespace: %s, ingress: %s",
+			ing.Namespace, ing.Name)
+		return serviceWeight
+	}
+
+	for k, v := range serviceWeight {
+		serviceWeight[k] = (v * 100) / total
+		klog.Infof("[service-weight] detail rule-value: %s=%d, namespace: %s, name: %s", k, v, ing.Namespace, ing.Name)
+	}
+	klog.Infof("[service-weight] split bluegreen strategy rules successfully, namespace: %s, name: %s",
+		ing.Namespace, ing.Name)
+	return serviceWeight
+}
+
+// split service-match annotation
+func splitServiceMatch(ing *ingress.Ingress) (svcStrategy map[string]*ingress.GrayStrategy) {
+	svcStrategy = make(map[string]*ingress.GrayStrategy)
+
+	if serviceMatch := ing.Annotations[AnnotationServiceMatch]; strings.TrimSpace(serviceMatch) != "" {
+		for _, annotation := range strings.Split(serviceMatch, "\n") {
+			if annotation = strings.TrimSpace(annotation); annotation == "" {
+				continue
+			}
+
+			klog.Infof("[service-match] received annotation, namespace: %s, ingress: %s, value: %s",
+				ing.Namespace, ing.Name, annotation)
+
+			// split service-match annotation
+			params := serviceMatchRegex.FindStringSubmatch(strings.TrimSpace(annotation))
+			if params == nil || len(params) != 5 {
+				klog.Warningf("[service-match] split failed because not excepted, namespace: %s, ingress: %s, "+
+					"value: %s", ing.Namespace, ing.Name, annotation)
+				return
+			}
+
+			// trim
+			for k, v := range params {
+				params[k] = strings.TrimSpace(v)
+			}
+
+			svc := params[1]
+			if svcStrategy[svc] == nil {
+				svcStrategy[svc] = &ingress.GrayStrategy{}
+			}
+			cod := params[2]
+			key := params[3]
+			val := params[4]
+			switch cod {
+			case "cookie":
+				{
+					if svcStrategy[svc].Cookie == nil {
+						svcStrategy[svc].Cookie = make(map[string]string)
+					}
+					if svcStrategy[svc].CookieRegex == nil {
+						svcStrategy[svc].CookieRegex = make(map[string]string)
+					}
+					if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+						svcStrategy[svc].CookieRegex[key] = val[1 : len(val)-1]
+						klog.Infof("[service-match] cookie regex rule, service: %s, rule: %s=%s", svc, key, val)
+					} else {
+						svcStrategy[svc].Cookie[key] = val
+						klog.Infof("[service-match] cookie normal rule, service: %s, rule: %s=%s", svc, key, val)
+					}
+					break
+				}
+			case "header":
+				{
+					if svcStrategy[svc].Header == nil {
+						svcStrategy[svc].Header = make(map[string]string)
+					}
+					if svcStrategy[svc].HeaderRegex == nil {
+						svcStrategy[svc].HeaderRegex = make(map[string]string)
+					}
+					if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+						svcStrategy[svc].HeaderRegex[key] = val[1 : len(val)-1]
+						klog.Infof("[service-match] header regex rule, service: %s, rule: %s=%s", svc, key, val)
+					} else {
+						svcStrategy[svc].Header[key] = val
+						klog.Infof("[service-match] header normal rule, service: %s, rule: %s=%s", svc, key, val)
+					}
+					break
+				}
+			case "query":
+				{
+					if svcStrategy[svc].Query == nil {
+						svcStrategy[svc].Query = make(map[string]string)
+					}
+					if svcStrategy[svc].QueryRegex == nil {
+						svcStrategy[svc].QueryRegex = make(map[string]string)
+					}
+					if len(val) >= 2 && val[0:1] == "/" && val[len(val)-1:] == "/" {
+						svcStrategy[svc].QueryRegex[key] = val[1 : len(val)-1]
+						klog.Infof("[service-match] query regex rule, service: %s, rule: %s=%s", svc, key, val)
+					} else {
+						svcStrategy[svc].Query[key] = val
+						klog.Infof("[service-match] query normal rule, service: %s, rule: %s=%s", svc, key, val)
+					}
+				}
+			default:
+			}
+			svcStrategy[svc].Service = svc
+		}
+		klog.Infof("[service-match] split gray strategy rules successfully, namespace: %s, name: %s",
+			ing.Namespace, ing.Name)
+	}
+	return svcStrategy
 }

@@ -17,9 +17,13 @@ limitations under the License.
 package ingress
 
 import (
+	"net"
+	"strings"
+
 	apiv1 "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1beta1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/klog"
 
 	"k8s.io/ingress-nginx/internal/ingress/annotations"
 	"k8s.io/ingress-nginx/internal/ingress/annotations/auth"
@@ -224,6 +228,8 @@ type Location struct {
 	// a '/'. If unspecified, the path defaults to a catch all sending
 	// traffic to the backend.
 	Path string `json:"path"`
+	// Gray publishing strategy with cookie
+	GrayStrategies []*GrayStrategy `json:"grayStrategy"`
 	// PathType represents the type of path referred to by a HTTPIngressPath.
 	PathType *networking.PathType `json:"pathType"`
 	// IsDefBackend indicates if service specified in the Ingress
@@ -338,6 +344,46 @@ type Location struct {
 	Opentracing opentracing.Config `json:"opentracing"`
 }
 
+type GrayStrategy struct {
+	// Cookie describes key-value cookie to use.
+	Cookie      map[string]string
+	CookieRegex map[string]string
+	// Header describes key-value header to use.
+	Header      map[string]string
+	HeaderRegex map[string]string
+	// Query describes key-value query params to use.
+	Query      map[string]string
+	QueryRegex map[string]string
+	// Service describes the service to use.
+	Service string
+	// Backend describes the endpoints to use.
+	Backend string
+}
+
+// GrayCookie describes gray publishing strategy with cookie
+type GrayCookieStrategy struct {
+	// Cookie describes key-value cookie to use.
+	Cookie map[string]string
+	// Service describes the service to use.
+	Service string
+	// Backend describes the endpoints to use.
+	Backend string
+}
+
+// GrayCookie describes gray publishing strategy with header
+type GrayHeaderStrategy struct {
+	Header  map[string]string
+	Service string
+	Backend string
+}
+
+// GrayCookie describes gray publishing strategy with header
+type GrayQueryStrategy struct {
+	Cookie  map[string]string
+	Service string
+	Backend string
+}
+
 // SSLPassthroughBackend describes a SSL upstream server configured
 // as passthrough (no TLS termination in the ingress controller)
 // The endpoints must provide the TLS termination exposing the required SSL certificate.
@@ -383,9 +429,49 @@ type ProxyProtocol struct {
 type Ingress struct {
 	networking.Ingress `json:"-"`
 	ParsedAnnotations  *annotations.Ingress `json:"parsedAnnotations"`
+
+	// gray strategy
+	GrayStrategy      map[string]*GrayStrategy `json:"grayStrategy"`
+	// blue green strategy
+	BlueGreenStrategy map[string]int           `json:"blueGreenStrategy"`
+	// service-domain, which service belong to which namespace
+	ServiceDomain     map[string]string        `json:"serviceDomain"`
+	// service-alias
+	ServiceAlias      map[string]string        `json:"serviceAlias"`
+
+	// if service is out-of-cluster, save them endpoint
+	ServiceOutClusterEndpoint map[string][]string `json:"serviceOutClusterEndpoint"`
+	// if service is out-of-cluster and value is domain, save the domain
+	ServiceOutClusterDomain   map[string]string   `json:"serviceOutClusterDomain"`
 }
 
 // GeneralConfig holds the definition of lua general configuration data
 type GeneralConfig struct {
 	ControllerPodsCount int `json:"controllerPodsCount"`
+}
+
+var (
+	OutOfClusterDomainAddrs = make(map[string][]string)
+)
+
+// ParseOutOfClusterHost parse the ips collection.
+// host example:
+// - 1.1.1.1||2.2.2.2||3.3.3.3
+// - test.com
+func (ing *Ingress) ParseOutOfClusterHost(upstreamName, host string) {
+	klog.Infof("[service-endpoint] parse out-of-cluster ips, hosts: %s", host)
+	slice := strings.Split(strings.TrimSpace(host), "||")
+
+	var addrs []string
+	for _, item := range slice {
+		ip := net.ParseIP(item)
+
+		if ip == nil {
+			// not an Ipv4 IP
+			klog.Errorf("[service-endpoint] not a correct ip, ip: %s", item)
+		} else {
+			addrs = append(addrs, item)
+		}
+	}
+	ing.ServiceOutClusterEndpoint[upstreamName] = addrs
 }
